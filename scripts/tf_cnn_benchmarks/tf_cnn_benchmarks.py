@@ -214,6 +214,12 @@ FLAGS = tf.flags.FLAGS
 
 log_fn = print   # tf.logging.info
 
+def create_done_queue(i, num_workers):  
+  with tf.device("/job:ps/task:%d" % (i)):
+    return tf.FIFOQueue(num_workers, tf.int32, shared_name="done_queue"+ str(i))
+  
+def create_done_queues(num_ps, num_workers):
+  return [create_done_queue(i, num_workers) for i in range(num_ps)]
 
 class GlobalStepWatcher(threading.Thread):
   """A helper class for globe_step.
@@ -562,7 +568,13 @@ class BenchmarkCNN(object):
   def run(self):
     if FLAGS.job_name == 'ps':
       log_fn('Running parameter server %s' % self.task_index)
-      self.server.join()
+      #self.server.join()
+      sess = tf.Session(self.server.target)
+      queue = create_done_queue(FLAGS.task_index, len(self.worker_hosts))
+      for i in range(len(self.worker_hosts)):
+        sess.run(queue.dequeue())
+        print ("ps %d received done %d" % (self.task_index, i))
+      print ("ps: %d: quitting" % (self.task_index))
       return
 
     with tf.Graph().as_default():
@@ -574,6 +586,11 @@ class BenchmarkCNN(object):
   def _eval_cnn(self):
     """Evaluate the model from a checkpoint using validation dataset."""
     (enqueue_ops, fetches) = self._build_model()
+    enq_ops = []
+    for q in create_done_queues(len(self.ps_hosts), len(self.worker_hosts)):
+      qop = q.enqueue(1)
+      enq_ops.append(qop)
+    
     saver = tf.train.Saver(self.variable_mgr.savable_variables())
     summary_writer = tf.summary.FileWriter(FLAGS.eval_dir,
                                            tf.get_default_graph())
@@ -614,9 +631,17 @@ class BenchmarkCNN(object):
       log_fn('Precision @ 1 = %.4f recall @ 5 = %.4f [%d examples]' %
              (precision_at_1, recall_at_5, total_eval_count))
 
+      for op in enq_ops:
+        sess.run(op)
+
   def _benchmark_cnn(self):
     """Run cnn in benchmark mode. When forward_only on, it forwards CNN."""
     (enqueue_ops, fetches) = self._build_model()
+    enq_ops = []
+    for q in create_done_queues(len(self.ps_hosts), len(self.worker_hosts)):
+      qop = q.enqueue(1)
+      enq_ops.append(qop)
+    
     fetches_list = nest.flatten(list(fetches.values()))
     main_fetch_group = tf.group(*fetches_list)
     execution_barrier = None
@@ -648,6 +673,7 @@ class BenchmarkCNN(object):
         FLAGS.save_summaries_steps > 0):
       summary_writer = tf.summary.FileWriter(FLAGS.train_dir,
                                              tf.get_default_graph())
+
 
     # We run the summaries in the same thread as the training operations by
     # passing in None for summary_op to avoid a summary_thread being started.
@@ -743,6 +769,10 @@ class BenchmarkCNN(object):
         # Wait for other workers to reach the end, so this worker doesn't
         # go away underneath them.
         sess.run([execution_barrier])
+      
+      for op in enq_ops:
+        sess.run(op)
+
     sv.stop()
 
   def _build_model(self):
